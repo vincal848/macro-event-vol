@@ -35,8 +35,19 @@ def step_events(cfg, refresh):
     events.validate_events(calendar, cfg, last_date)
 
 
+def _read_events():
+    path = data.processed_path("events.parquet")
+    if not path.exists():
+        raise RuntimeError("events.parquet missing: run --step events first")
+    return pd.read_parquet(path)
+
+
 def step_options(cfg, refresh):
-    raise NotImplementedError
+    underlying = pd.read_parquet(data.raw_path("optionmetrics", "underlying.parquet"))
+    structures, misses = options.build_structures(
+        data.load_options(cfg), underlying, _read_events(), cfg)
+    structures.to_parquet(data.processed_path("structures.parquet"), index=False)
+    options.validate_structures(structures, misses, len(underlying) - 1)
 
 
 def step_signal(cfg, refresh):
