@@ -97,6 +97,11 @@ def build_calendar(cfg: dict, release_dates: pd.DataFrame,
     calendar, source = trading_calendar(underlying, start - pd.Timedelta(days=15),
                                         end + pd.Timedelta(days=15))
     print(f"  trading calendar: {source}")
+    if underlying is not None:
+        before = len(events)
+        events = events[events["event_date"] <= calendar.max()]
+        _log_drop(f"event_date <= last date with data {calendar.max().date()} "
+                  "(later events are outside the sample)", before, len(events))
 
     # Releases on non-trading days (e.g. payrolls on Good Friday).
     events = events.rename(columns={"event_date": "release_date"})
