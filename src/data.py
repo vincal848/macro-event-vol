@@ -71,6 +71,83 @@ def pull_underlying(cfg: dict) -> pd.DataFrame:
 
 # --- FRED / ALFRED ----------------------------------------------------------
 
+FRED_API = "https://api.stlouisfed.org/fred/"
+
+
+def fred_get(endpoint: str, **params) -> dict:
+    """GET one FRED API endpoint as JSON. The key is read from .env and never
+    printed: errors report FRED's message, not the request URL."""
+    import json
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    key = os.getenv("FRED_API_KEY")
+    if not key:
+        raise RuntimeError("Set FRED_API_KEY in .env")
+    query = urllib.parse.urlencode({**params, "api_key": key, "file_type": "json"})
+    try:
+        with urllib.request.urlopen(f"{FRED_API}{endpoint}?{query}", timeout=60) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            message = json.load(e).get("error_message", "")
+        except ValueError:
+            message = ""
+        raise RuntimeError(f"FRED {endpoint} {params}: HTTP {e.code} {message}") from None
+
+
+def fred_release(series_id: str) -> dict:
+    """The FRED release that publishes a series: {'id': ..., 'name': ...}."""
+    releases = fred_get("series/release", series_id=series_id)["releases"]
+    if len(releases) != 1:
+        raise RuntimeError(f"{series_id}: expected one release, got {releases}")
+    return releases[0]
+
+
+def fred_release_dates(release_id: int) -> list[str]:
+    """Every historical date of a release, all vintages, dates with data only."""
+    dates, offset = [], 0
+    while True:
+        page = fred_get(
+            "release/dates", release_id=release_id, realtime_start="1776-07-04",
+            realtime_end="9999-12-31", sort_order="asc", limit=10000, offset=offset,
+            include_release_dates_with_no_data="false",
+        )
+        dates += [d["date"] for d in page["release_dates"]]
+        offset += len(page["release_dates"])
+        if offset >= page["count"] or not page["release_dates"]:
+            return dates
+
+
+def pull_release_dates(cfg: dict, refresh: bool = False) -> pd.DataFrame:
+    """Historical release dates for each event with an anchor_series.
+
+    Output: raw/fred/release_dates.parquet (event, release_date)
+    """
+    path = raw_path("fred", "release_dates.parquet")
+    if path.exists() and not refresh:
+        return pd.read_parquet(path)
+
+    frames = []
+    for event, spec in cfg["events"].items():
+        if "anchor_series" not in spec:
+            continue
+        release = fred_release(spec["anchor_series"])
+        dates = fred_release_dates(release["id"])
+        if not dates:
+            raise RuntimeError(f"{event}: release {release['id']} returned no dates")
+        print(f"  {event}: {spec['anchor_series']} -> release {release['id']} "
+              f"'{release['name']}', {len(dates)} dates {dates[0]} to {dates[-1]}")
+        frames.append(pd.DataFrame({"event": event, "release_date": pd.to_datetime(dates)}))
+
+    out = pd.concat(frames, ignore_index=True)
+    if out.duplicated(["event", "release_date"]).any():
+        raise RuntimeError("duplicate event, release_date in FRED release dates")
+    out.to_parquet(path, index=False)
+    return out
+
+
 def pull_fred(cfg: dict) -> pd.DataFrame:
     """Pull every series in cfg["series"], with vintages where available.
 
@@ -87,5 +164,11 @@ def read_bloomberg_calendar(cfg: dict) -> pd.DataFrame:
 
     Expected columns per event: release date, actual (first release), survey
     median, survey standard deviation.
+
+    Returns None when no export is present, so the pipeline runs without
+    Bloomberg. Reading the exports is step 7.
     """
-    raise NotImplementedError
+    folder = data_dir() / "raw" / "bloomberg"
+    if not folder.exists() or not any(folder.glob("*.csv")):
+        return None
+    raise NotImplementedError("Bloomberg exports found; reader is built in step 7")

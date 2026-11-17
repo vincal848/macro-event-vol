@@ -1,23 +1,146 @@
 """Event calendar and surprises."""
 
+import numpy as np
 import pandas as pd
 
+MONTHLY_RANGE = (11, 12)   # acceptance: releases per full calendar year
+FOMC_PER_YEAR = 8
+GDP_PER_YEAR = 4
 
-def build_calendar(cfg: dict, bloomberg: pd.DataFrame) -> pd.DataFrame:
+
+def trading_calendar(underlying: pd.DataFrame | None, start, end) -> tuple[pd.DatetimeIndex, str]:
+    """Trading dates from the underlying table, or weekdays if it does not
+    exist yet (recompute the calendar after the WRDS pull)."""
+    if underlying is not None:
+        return pd.DatetimeIndex(underlying["date"]).sort_values(), "underlying"
+    return pd.bdate_range(start, end), "weekdays (underlying not pulled yet)"
+
+
+def _log_drop(label: str, before: int, after: int) -> None:
+    print(f"  filter {label}: removed {before - after} rows ({after} left)")
+
+
+def _advance_estimates(dates: pd.Series) -> pd.Series:
+    """First release date after each quarter end."""
+    quarter_end = (dates - pd.offsets.QuarterEnd(1)).dt.normalize()
+    keep = dates.groupby(quarter_end.dt.to_period("Q")).transform("min") == dates
+    return dates[keep]
+
+
+def build_calendar(cfg: dict, release_dates: pd.DataFrame,
+                   underlying: pd.DataFrame | None = None,
+                   today: pd.Timestamp | None = None) -> pd.DataFrame:
     """One row per release.
 
-    Columns: event, family, date, time_et, actual, consensus, dispersion.
-    Uses first-release values only.
-    Output: processed/events.parquet
+    Columns: event, family, event_date, entry_date, time_et, n_events_on_date
+    is added by flag_overlaps.
     """
-    raise NotImplementedError
+    today = (today or pd.Timestamp.today()).normalize()
+    frames = []
+    for event, spec in cfg["events"].items():
+        if event == "fomc":
+            dates = pd.Series(pd.to_datetime(cfg["fomc_dates"]))
+        else:
+            dates = release_dates.loc[release_dates["event"] == event, "release_date"]
+            if dates.empty:
+                raise RuntimeError(f"{event}: no release dates")
+            if spec.get("first_release_after_quarter_end"):
+                before = len(dates)
+                dates = _advance_estimates(dates)
+                _log_drop(f"{event} advance estimate only", before, len(dates))
+        frames.append(pd.DataFrame({
+            "event": event, "family": spec["family"],
+            "event_date": pd.to_datetime(dates.to_numpy()), "time_et": spec["time_et"],
+        }))
+    events = pd.concat(frames, ignore_index=True)
+
+    start = pd.Timestamp(cfg["sample"]["start"])
+    end = pd.Timestamp(cfg["sample"]["end"]) if cfg["sample"]["end"] else today
+    before = len(events)
+    events = events[events["event_date"] >= start]
+    _log_drop(f"event_date >= sample start {start.date()}", before, len(events))
+    before = len(events)
+    events = events[events["event_date"] <= end]
+    _log_drop(f"event_date <= {'sample end' if cfg['sample']['end'] else 'today'} {end.date()}",
+              before, len(events))
+
+    calendar, source = trading_calendar(underlying, start - pd.Timedelta(days=15), end)
+    print(f"  trading calendar: {source}")
+    pos = calendar.searchsorted(events["event_date"].to_numpy(), side="left") - 1
+    if (pos < 0).any():
+        raise RuntimeError("event before the first trading date; extend the calendar")
+    events = events.assign(entry_date=calendar[pos])
+
+    events = events.sort_values(["event_date", "event"]).reset_index(drop=True)
+    if events.duplicated(["event", "event_date"]).any():
+        raise RuntimeError("duplicate event, event_date in calendar")
+    return events[["event", "family", "event_date", "entry_date", "time_et"]]
 
 
-def add_surprises(events: pd.DataFrame) -> pd.DataFrame:
-    """Add the standardized surprise: (actual - consensus) / dispersion."""
-    raise NotImplementedError
+def add_surprises(events: pd.DataFrame, bloomberg: pd.DataFrame | None) -> pd.DataFrame:
+    """Add the standardized surprise: (actual - consensus) / dispersion.
+
+    Skipped without error when there is no Bloomberg export.
+    """
+    if bloomberg is None:
+        print("  no Bloomberg export: surprises skipped")
+        return events
+    out = events.merge(bloomberg, on=["event", "event_date"], how="left", validate="1:1")
+    out["surprise_z"] = (out["actual"] - out["consensus"]) / out["dispersion"].replace(0, np.nan)
+    return out
 
 
 def flag_overlaps(events: pd.DataFrame) -> pd.DataFrame:
-    """Flag dates with more than one release so they can be handled explicitly."""
-    raise NotImplementedError
+    """Number of releases sharing each event date."""
+    return events.assign(
+        n_events_on_date=events.groupby("event_date")["event"].transform("size"))
+
+
+# --- acceptance -------------------------------------------------------------
+
+def _full_years(events: pd.DataFrame, cfg: dict, last_date: pd.Timestamp) -> range:
+    start = pd.Timestamp(cfg["sample"]["start"])
+    first = start.year if start == pd.Timestamp(start.year, 1, 1) else start.year + 1
+    last = last_date.year if last_date >= pd.Timestamp(last_date.year, 12, 31) else last_date.year - 1
+    return range(first, last + 1)
+
+
+def _count_check(events, event, years, lo, hi) -> bool:
+    counts = (events.loc[events["event"] == event, "event_date"].dt.year
+              .value_counts().reindex(years, fill_value=0))
+    bad = counts[(counts < lo) | (counts > hi)]
+    want = f"{lo}" if lo == hi else f"{lo}-{hi}"
+    print(f"  {'PASS' if bad.empty else 'FAIL'}  {event}: {want} per full year "
+          f"{years[0]}-{years[-1]}")
+    for year, n in bad.items():
+        print(f"          {year}: {n}")
+    return bad.empty
+
+
+def validate_events(events: pd.DataFrame, cfg: dict, last_date: pd.Timestamp) -> None:
+    years = list(_full_years(events, cfg, last_date))
+    ok = True
+    for event, spec in cfg["events"].items():
+        if event == "fomc":
+            ok &= _count_check(events, event, years, FOMC_PER_YEAR, FOMC_PER_YEAR)
+        elif spec.get("first_release_after_quarter_end"):
+            ok &= _count_check(events, event, years, GDP_PER_YEAR, GDP_PER_YEAR)
+        else:
+            ok &= _count_check(events, event, years, *MONTHLY_RANGE)
+
+    weekend = events[events["event_date"].dt.dayofweek >= 5]
+    print(f"  {'PASS' if weekend.empty else 'FAIL'}  no event date on a weekend "
+          f"({len(weekend)} found)")
+    if not weekend.empty:
+        print(weekend.to_string(index=False))
+    ok &= weekend.empty
+
+    print("  Five dates to confirm by eye (first release of each event in the "
+          "middle year of the sample):")
+    mid = years[len(years) // 2]
+    sample = (events[events["event_date"].dt.year == mid]
+              .groupby("event").head(1).head(5))
+    print(sample.to_string(index=False))
+
+    if not ok:
+        raise AssertionError("events: acceptance checks failed (see FAIL lines)")

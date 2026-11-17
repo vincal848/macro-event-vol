@@ -2,34 +2,43 @@
 
     python run.py
     python run.py --step data
+    python run.py --step events --refresh   # re-pull instead of reading the cache
 """
 
 import argparse
 
+import pandas as pd
+
 from src import backtest, data, events, options, signal
 
 
-def step_data(cfg):
+def step_data(cfg, refresh):
     data.pull_fred(cfg)
     data.pull_underlying(cfg)
     data.pull_options(cfg)
 
 
-def step_events(cfg):
-    calendar = events.build_calendar(cfg, data.read_bloomberg_calendar(cfg))
-    calendar = events.flag_overlaps(events.add_surprises(calendar))
-    calendar.to_parquet(data.processed_path("events.parquet"))
+def step_events(cfg, refresh):
+    releases = data.pull_release_dates(cfg, refresh)
+    underlying_path = data.raw_path("optionmetrics", "underlying.parquet")
+    underlying = pd.read_parquet(underlying_path) if underlying_path.exists() else None
+    calendar = events.build_calendar(cfg, releases, underlying)
+    calendar = events.add_surprises(calendar, data.read_bloomberg_calendar(cfg))
+    calendar = events.flag_overlaps(calendar)
+    calendar.to_parquet(data.processed_path("events.parquet"), index=False)
+    last_date = underlying["date"].max() if underlying is not None else pd.Timestamp.today()
+    events.validate_events(calendar, cfg, last_date)
 
 
-def step_options(cfg):
+def step_options(cfg, refresh):
     raise NotImplementedError
 
 
-def step_signal(cfg):
+def step_signal(cfg, refresh):
     raise NotImplementedError
 
 
-def step_backtest(cfg):
+def step_backtest(cfg, refresh):
     raise NotImplementedError
 
 
@@ -45,12 +54,14 @@ STEPS = {
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--step", choices=STEPS, help="run a single step")
+    parser.add_argument("--refresh", action="store_true",
+                        help="pull again even if cached files exist")
     args = parser.parse_args()
 
     cfg = data.load_config()
     for name in [args.step] if args.step else STEPS:
         print(f"== {name} ==")
-        STEPS[name](cfg)
+        STEPS[name](cfg, args.refresh)
 
 
 if __name__ == "__main__":
