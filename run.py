@@ -55,7 +55,17 @@ def step_signal(cfg, refresh):
 
 
 def step_backtest(cfg, refresh):
-    raise NotImplementedError
+    path = data.processed_path("structures.parquet")
+    if not path.exists():
+        raise RuntimeError("structures.parquet missing: run --step options first")
+    structures = pd.read_parquet(path)
+    out = backtest.base_backtest(structures, cfg)
+    out["results"].to_parquet(data.processed_path("results.parquet"), index=False)
+    out["by_group"].to_parquet(data.processed_path("results_by_group.parquet"), index=False)
+    out["event_minus_non_event"].to_parquet(
+        data.processed_path("results_event_minus_non_event.parquet"), index=False)
+    backtest.plot_cumulative(structures, data.processed_path("figures") / "cumulative_pnl.png")
+    backtest.validate_backtest(structures, out)
 
 
 STEPS = {
