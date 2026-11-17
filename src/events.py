@@ -4,9 +4,14 @@ import numpy as np
 import pandas as pd
 import pandas.tseries.holiday as hol
 
-MONTHLY_RANGE = (11, 12)   # acceptance: releases per full calendar year
-FOMC_PER_YEAR = 8
-GDP_PER_YEAR = 4
+# Acceptance: releases per full calendar year, as (low, high, tolerance).
+# Inside low-high: PASS. Within `tolerance` of the range: WARN, printed but not
+# raised (real gaps such as shutdowns, delayed or combined releases). Beyond
+# that: FAIL, which points to a structural error (wrong release ID, revision
+# dates listed as releases, a broken pull).
+MONTHLY_COUNT = (11, 12, 2)
+GDP_COUNT = (4, 4, 1)
+FOMC_COUNT = (8, 8, 0)     # from config; cancellations are listed there
 
 
 class NYSEHolidays(hol.AbstractHolidayCalendar):
@@ -150,18 +155,19 @@ def _full_years(events: pd.DataFrame, cfg: dict, last_date: pd.Timestamp) -> ran
     return range(first, last + 1)
 
 
-def _count_check(events, event, years, lo, hi, extra=()) -> bool:
+def _count_check(events, event, years, lo, hi, tol, extra=()) -> bool:
     dates = pd.concat([events.loc[events["event"] == event, "event_date"],
                        pd.Series(pd.to_datetime(list(extra)), dtype="datetime64[ns]")])
     counts = dates.dt.year.value_counts().reindex(years, fill_value=0)
-    bad = counts[(counts < lo) | (counts > hi)]
+    off = counts[(counts < lo) | (counts > hi)]
+    fail = off[(off < lo - tol) | (off > hi + tol)]
+    status = "FAIL" if not fail.empty else "WARN" if not off.empty else "PASS"
     want = f"{lo}" if lo == hi else f"{lo}-{hi}"
     note = f" (incl. {len(extra)} cancelled)" if len(extra) else ""
-    print(f"  {'PASS' if bad.empty else 'FAIL'}  {event}: {want} per full year "
-          f"{years[0]}-{years[-1]}{note}")
-    for year, n in bad.items():
-        print(f"          {year}: {n}")
-    return bad.empty
+    print(f"  {status}  {event}: {want} per full year {years[0]}-{years[-1]}{note}")
+    for year, n in off.items():
+        print(f"          {year}: {n}{'  <- outside tolerance' if year in fail.index else ''}")
+    return fail.empty
 
 
 def validate_events(events: pd.DataFrame, cfg: dict, last_date: pd.Timestamp) -> None:
@@ -169,12 +175,12 @@ def validate_events(events: pd.DataFrame, cfg: dict, last_date: pd.Timestamp) ->
     ok = True
     for event, spec in cfg["events"].items():
         if event == "fomc":
-            ok &= _count_check(events, event, years, FOMC_PER_YEAR, FOMC_PER_YEAR,
+            ok &= _count_check(events, event, years, *FOMC_COUNT,
                                extra=cfg.get("fomc_cancelled", []))
         elif spec.get("first_release_after_quarter_end"):
-            ok &= _count_check(events, event, years, GDP_PER_YEAR, GDP_PER_YEAR)
+            ok &= _count_check(events, event, years, *GDP_COUNT)
         else:
-            ok &= _count_check(events, event, years, *MONTHLY_RANGE)
+            ok &= _count_check(events, event, years, *MONTHLY_COUNT)
 
     # On release_date: event_date is a trading date by construction, so a
     # weekend in the source would otherwise be silently rolled to Monday.
