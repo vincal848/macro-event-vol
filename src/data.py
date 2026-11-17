@@ -120,10 +120,25 @@ def fred_release_dates(release_id: int) -> list[str]:
             return dates
 
 
+def fred_first_release_dates(series_id: str) -> set[pd.Timestamp]:
+    """Dates on which a series first published a new observation (ALFRED,
+    output_type 4 = initial release only)."""
+    obs = fred_get("series/observations", series_id=series_id, output_type=4,
+                   realtime_start="1776-07-04", realtime_end="9999-12-31")["observations"]
+    if not obs:
+        raise RuntimeError(f"{series_id}: no initial-release observations")
+    return set(pd.to_datetime([o["realtime_start"] for o in obs]))
+
+
 def pull_release_dates(cfg: dict, refresh: bool = False) -> pd.DataFrame:
     """Historical release dates for each event with an anchor_series.
 
-    Output: raw/fred/release_dates.parquet (event, release_date)
+    FRED's release calendar also lists revision-only dates (CPI seasonal
+    factors, annual benchmarks, corrections). new_observation marks dates
+    on which the anchor series published a new observation; build_calendar
+    keeps only those.
+
+    Output: raw/fred/release_dates.parquet (event, release_date, new_observation)
     """
     path = raw_path("fred", "release_dates.parquet")
     if path.exists() and not refresh:
@@ -139,7 +154,14 @@ def pull_release_dates(cfg: dict, refresh: bool = False) -> pd.DataFrame:
             raise RuntimeError(f"{event}: release {release['id']} returned no dates")
         print(f"  {event}: {spec['anchor_series']} -> release {release['id']} "
               f"'{release['name']}', {len(dates)} dates {dates[0]} to {dates[-1]}")
-        frames.append(pd.DataFrame({"event": event, "release_date": pd.to_datetime(dates)}))
+        first = fred_first_release_dates(spec["anchor_series"])
+        df = pd.DataFrame({"event": event, "release_date": pd.to_datetime(dates)})
+        df["new_observation"] = df["release_date"].isin(first)
+        missing = first - set(df["release_date"])
+        if missing:
+            print(f"    note: {len(missing)} first-release dates of {spec['anchor_series']} "
+                  f"not on the release calendar, e.g. {sorted(missing)[-3:]}")
+        frames.append(df)
 
     out = pd.concat(frames, ignore_index=True)
     if out.duplicated(["event", "release_date"]).any():

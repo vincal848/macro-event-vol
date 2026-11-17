@@ -69,9 +69,11 @@ def build_calendar(cfg: dict, release_dates: pd.DataFrame,
         if event == "fomc":
             dates = pd.Series(pd.to_datetime(cfg["fomc_dates"]))
         else:
-            dates = release_dates.loc[release_dates["event"] == event, "release_date"]
-            if dates.empty:
+            rel = release_dates[release_dates["event"] == event]
+            if rel.empty:
                 raise RuntimeError(f"{event}: no release dates")
+            dates = rel.loc[rel["new_observation"], "release_date"]
+            _log_drop(f"{event} revision-only dates (no new observation)", len(rel), len(dates))
             if spec.get("first_release_after_quarter_end"):
                 before = len(dates)
                 dates = _advance_estimates(dates)
