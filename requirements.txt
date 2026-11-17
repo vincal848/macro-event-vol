@@ -1,0 +1,10 @@
+pandas
+numpy
+pyarrow
+pyyaml
+python-dotenv
+wrds
+fredapi
+statsmodels
+matplotlib
+jupyter

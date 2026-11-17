@@ -1,0 +1,92 @@
+# All project parameters live here. Change values here, not in code.
+# Bloomberg tickers and OptionMetrics identifiers are from memory:
+# verify each on the terminal / WRDS before the first pull.
+
+sample:
+  start: "2012-01-01"
+  end: null            # null = latest available
+
+# Releases traded. To add one, add an entry.
+#   family:   inflation | labor | activity | policy
+#   bbg:      Bloomberg economic calendar ticker
+#   time_et:  scheduled release time, US Eastern
+events:
+  cpi:
+    family: inflation
+    bbg: "CPI CHNG Index"
+    time_et: "08:30"
+  pce:
+    family: inflation
+    bbg: "PCE CMOM Index"
+    time_et: "08:30"
+  payrolls:
+    family: labor
+    bbg: "NFP TCH Index"
+    time_et: "08:30"
+  jolts:
+    family: labor
+    bbg: "JOLTTOTL Index"
+    time_et: "10:00"
+  gdp:
+    family: activity
+    bbg: "GDP CQOQ Index"
+    time_et: "08:30"
+  retail_sales:
+    family: activity
+    bbg: "RSTAMOM Index"
+    time_et: "08:30"
+  fomc:
+    family: policy
+    bbg: "FDTR Index"
+    time_et: "14:00"
+
+# FRED series behind each composite in the focus score.
+# Pulled with real-time vintages (ALFRED) where available.
+series:
+  inflation:
+    - PCEPILFE               # core PCE price index
+    - CPILFESL               # core CPI
+    - PCETRIM12M159SFRBDAL   # Dallas Fed trimmed-mean PCE, 12-month
+    - MEDCPIM158SFRBCLE      # Cleveland Fed median CPI
+    - CES0500000003          # average hourly earnings
+    - ECIWAG                 # Employment Cost Index, wages
+    - MICH                   # Michigan 1-year inflation expectations
+    - T5YIFR                 # 5-year, 5-year forward breakeven
+  labor:
+    - UNRATE                 # unemployment rate
+    - NROU                   # natural rate estimate (CBO)
+    - CIVPART                # participation rate
+    - LNS12300060            # prime-age employment ratio
+    - JTSJOL                 # job openings
+    - JTSQUR                 # quits rate
+    - ICSA                   # initial claims
+  activity:
+    - GDPC1                  # real GDP
+    - RSAFS                  # retail sales
+    - INDPRO                 # industrial production
+  rates:
+    - DGS2                   # 2-year Treasury yield
+
+options:
+  underlying: SPX
+  optionmetrics_secid: 108105   # S&P 500 index; verify in optionm.securd
+  wing_width_pct: 0.02          # distance of the protective options from the strike
+  entry: prior_close
+  exit: event_close
+
+costs:
+  fill: mid                     # mid | cross (sell at bid, buy at ask)
+  half_spread_haircut: 0.5      # fraction of half-spread paid when fill = mid
+
+signal:
+  zscore_window_months: 60
+  sensitivity_window_events: 24
+  layer_weights:                # fixed in advance
+    fundamentals: 1
+    fed_assessment: 1
+    sensitivity: 1
+
+overlay:
+  # Position size by focus-score rank of the event's family
+  size_low_focus: 1.0
+  size_high_focus: 0.0
