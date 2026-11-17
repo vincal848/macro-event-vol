@@ -17,6 +17,8 @@ release matters for policy (research component).
 2. Copy `.env.example` to `.env` and fill in:
    - `WRDS_USERNAME`: your own WRDS username. The first connection asks for
      your password and offers to save it in a local `.pgpass` file.
+   - `FRED_API_KEY`: free key from
+     https://fred.stlouisfed.org/docs/api/api_key.html
    - `DATA_DIR`: path to your local sync of the shared data folder. Leave it
      blank to use `./data`.
 
@@ -25,6 +27,7 @@ release matters for policy (research component).
    ```
    python run.py              # all steps
    python run.py --step data  # one step: data, events, options, signal, backtest
+   python run.py --step events --refresh  # re-pull instead of reading cached files
    ```
 
 ## Data
