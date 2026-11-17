@@ -50,23 +50,219 @@ def wrds_connection():
     return wrds.Connection(wrds_username=username)
 
 
-def pull_options(cfg: dict) -> pd.DataFrame:
-    """Pull end-of-day index option quotes from OptionMetrics.
+# What the OptionMetrics library holds (inspected on WRDS, 2026-11-17):
+# - optionm has per-year tables opprcd<YYYY> (option quotes) and secprd<YYYY>
+#   (security prices), 1996-2025. Data end on 2025-08-29.
+# - opprcd: secid, date, symbol, exdate, cp_flag, strike_price, best_bid,
+#   best_offer, volume, open_interest, impl_volatility, delta, optionid,
+#   am_settlement, expiry_indicator, root (null), ... strike_price is the
+#   strike x 1000 (4200000 = 4200).
+# - am_settlement = 1: morning-settled standard monthly SPX. 0: close-settled
+#   SPXW (expiry_indicator 'w' weekly, 'm' month-end, null on standard dates).
+# - secnmd / securd: secid 108105 is ticker SPX, "CBOE S&P 500 INDEX",
+#   index_flag 1. Matches config options.optionmetrics_secid.
+# - secprd: date, close (index level); 2023-06-01 close 4221.02.
 
-    Only contracts expiring within a few days of an event are needed, so the
-    query should be filtered by the event calendar to keep it small.
-    Output: raw/optionmetrics/options.parquet
+def _wrds_years(db, cfg: dict) -> list[int]:
+    """Years in the sample that have both an opprcd and a secprd table."""
+    tables = set(db.list_tables("optionm"))
+    start = pd.Timestamp(cfg["sample"]["start"]).year
+    end = pd.Timestamp(cfg["sample"]["end"]).year if cfg["sample"]["end"] else 9999
+    years = [y for y in range(start, min(end, pd.Timestamp.today().year) + 1)
+             if f"opprcd{y}" in tables and f"secprd{y}" in tables]
+    if not years:
+        raise RuntimeError("no OptionMetrics tables for the sample period")
+    return years
+
+
+def _in_sample(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    keep = df["date"] >= pd.Timestamp(cfg["sample"]["start"])
+    if cfg["sample"]["end"]:
+        keep &= df["date"] <= pd.Timestamp(cfg["sample"]["end"])
+    return df[keep]
+
+
+def pull_underlying(cfg: dict, refresh: bool = False, db=None) -> pd.DataFrame:
+    """Daily index close from optionm.secprd<year>.
+
+    Output: raw/optionmetrics/underlying.parquet (date, close). Its dates are
+    the project's trading calendar.
     """
-    # TODO: query optionm.opprcd<year> for cfg["options"]["optionmetrics_secid"]
-    raise NotImplementedError
+    path = raw_path("optionmetrics", "underlying.parquet")
+    if path.exists() and not refresh:
+        return pd.read_parquet(path)
+
+    db = db or wrds_connection()
+    secid = cfg["options"]["optionmetrics_secid"]
+    frames = []
+    for year in _wrds_years(db, cfg):
+        df = db.raw_sql(f"select date, close from optionm.secprd{year} where secid = %(secid)s",
+                        params={"secid": secid}, date_cols=["date"])
+        if df.empty:
+            raise RuntimeError(f"secprd{year}: no rows for secid {secid}")
+        frames.append(df)
+    out = _in_sample(pd.concat(frames, ignore_index=True), cfg)
+    out = out.sort_values("date").reset_index(drop=True)
+    out["date"] = out["date"].astype("datetime64[ns]")
+    if out["date"].duplicated().any():
+        raise RuntimeError("underlying: duplicate dates")
+    if out["close"].isna().any() or (out["close"] <= 0).any():
+        raise RuntimeError("underlying: missing or non-positive closes")
+    out.to_parquet(path, index=False)
+    return out
 
 
-def pull_underlying(cfg: dict) -> pd.DataFrame:
-    """Pull daily index closes from OptionMetrics (optionm.secprd).
+OPTION_COLUMNS = ["date", "exdate", "cp_flag", "strike", "best_bid", "best_offer",
+                  "volume", "open_interest", "impl_volatility", "delta", "optionid",
+                  "am_settlement", "symbol"]
 
-    Output: raw/optionmetrics/underlying.parquet
+OPTIONS_SQL = """
+    select o.date, o.exdate, o.cp_flag, o.strike_price, o.best_bid, o.best_offer,
+           o.volume, o.open_interest, o.impl_volatility, o.delta, o.optionid,
+           o.am_settlement, o.symbol
+    from optionm.opprcd{y} o
+    join optionm.secprd{y} p on p.secid = o.secid and p.date = o.date
+    where o.secid = %(secid)s
+      and o.exdate - o.date between 0 and %(max_days)s
+      and abs(o.strike_price / %(scale)s / p.close - 1) <= %(band)s
+"""
+
+
+def _strike_scale(db, secid: int, year: int) -> int:
+    """Strike multiplier, checked against the close on one day rather than
+    assuming the documented x1000."""
+    df = db.raw_sql(f"""
+        select o.strike_price / p.close as ratio
+        from optionm.opprcd{year} o join optionm.secprd{year} p
+          on p.secid = o.secid and p.date = o.date
+        where o.secid = %(secid)s and o.date = (select max(date) from optionm.secprd{year}
+                                                where secid = %(secid)s)
+    """, params={"secid": secid})
+    if df.empty:
+        raise RuntimeError("strike scale check: no rows")
+    ratio = df["ratio"].median()
+    scale = 1000 if 500 < ratio < 2000 else 1 if 0.5 < ratio < 2 else None
+    if scale is None:
+        raise RuntimeError(f"strike scale check: median strike/close {ratio:.3f}")
+    print(f"  strike scale: median strike_price/close = {ratio:.1f} -> divide by {scale}")
+    return scale
+
+
+def pull_options(cfg: dict, refresh: bool = False, db=None) -> None:
+    """Short-dated S&P 500 index option quotes, one query per year.
+
+    Filtered in SQL to the index secid, 0 to options.max_days_to_expiry days
+    to expiry, and strikes within options.strike_band_pct of that day's close.
+    Output: raw/optionmetrics/options_<year>.parquet (read with load_options)
     """
-    raise NotImplementedError
+    o = cfg["options"]
+    db = db or wrds_connection()
+    years = _wrds_years(db, cfg)
+    scale = None
+    for year in years:
+        path = raw_path("optionmetrics", f"options_{year}.parquet")
+        if path.exists() and not refresh:
+            continue
+        scale = scale or _strike_scale(db, o["optionmetrics_secid"], years[-1])
+        df = db.raw_sql(OPTIONS_SQL.format(y=year), date_cols=["date", "exdate"], params={
+            "secid": o["optionmetrics_secid"], "max_days": o["max_days_to_expiry"],
+            "band": o["strike_band_pct"], "scale": scale})
+        if df.empty:
+            raise RuntimeError(f"opprcd{year}: query returned no rows")
+        df["strike"] = df.pop("strike_price") / scale
+        before = len(df)
+        df = _in_sample(df, cfg)
+        if len(df) != before:
+            print(f"  {year}: sample window removed {before - len(df)} rows")
+        for c in ["date", "exdate"]:
+            df[c] = df[c].astype("datetime64[ns]")
+        df = df[OPTION_COLUMNS].reset_index(drop=True)
+        df.to_parquet(path, index=False)
+        print(f"  options {year}: {len(df):,} rows")
+
+
+def load_options(cfg: dict) -> pd.DataFrame:
+    """All cached option years in one frame."""
+    files = sorted((data_dir() / "raw" / "optionmetrics").glob("options_*.parquet"))
+    if not files:
+        raise RuntimeError("no options_<year>.parquet files; run the data step")
+    return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+
+
+def validate_options(cfg: dict) -> None:
+    """Step 2 acceptance checks."""
+    import numpy as np
+
+    und = pd.read_parquet(raw_path("optionmetrics", "underlying.parquet"))
+    opt = load_options(cfg)
+    ok = True
+
+    def check(name, passed, detail=""):
+        nonlocal ok
+        ok &= bool(passed)
+        print(f"  {'PASS' if passed else 'FAIL'}  {name}{': ' + detail if detail else ''}")
+
+    last = und["date"].max()
+    print(f"  underlying: {len(und):,} trading dates {und['date'].min().date()} to {last.date()}")
+
+    counts = opt.groupby(opt["date"].dt.year).size()
+    years = range(und["date"].min().year, last.year + 1)
+    empty = [y for y in years if counts.get(y, 0) == 0]
+    print("  option rows per year:")
+    for y in years:
+        print(f"    {y}: {counts.get(y, 0):>10,}")
+    check("no empty year", not empty, f"empty: {empty}" if empty else "")
+
+    dup = opt.duplicated(["date", "optionid"]).sum()
+    check("no duplicate date, optionid", dup == 0, f"{dup} duplicates" if dup else "")
+
+    for col in ["date", "exdate", "cp_flag", "strike", "optionid", "am_settlement"]:
+        n = opt[col].isna().sum()
+        check(f"no nulls in {col}", n == 0, f"{n} nulls" if n else "")
+    check("cp_flag in C/P", opt["cp_flag"].isin(["C", "P"]).all())
+    check("am_settlement in 0/1", opt["am_settlement"].isin([0, 1]).all())
+    orphan = ~opt["date"].isin(und["date"])
+    check("every option date has an index close", not orphan.any(),
+          f"{orphan.sum()} rows" if orphan.any() else "")
+
+    good = (opt["best_bid"] > 0) & (opt["best_offer"] > opt["best_bid"])
+    print(f"  share with best_bid > 0 and best_offer > best_bid: {good.mean():.1%} "
+          f"({good.sum():,} of {len(opt):,})")
+
+    print("  ATM quotes on three dates (nearest close-settled expiry after the date, as "
+          "traded at entry; strike nearest close):")
+    tradable = opt[(opt["am_settlement"] == 0) & good & (opt["exdate"] > opt["date"])]
+    quoted = und[und["date"].isin(tradable["date"])].reset_index(drop=True)
+    for target in und["date"].iloc[[len(und) // 10, len(und) // 2, len(und) * 9 // 10]]:
+        d = quoted.loc[quoted["date"] >= target, "date"].iloc[0]   # first date with quotes
+        close = quoted.loc[quoted["date"] == d, "close"].iloc[0]
+        q = tradable[tradable["date"] == d]
+        q = q[q["exdate"] == q["exdate"].min()]
+        both = q.groupby("strike")["cp_flag"].nunique()
+        both = both[both == 2].index.to_numpy()
+        k = both[np.abs(both - close).argmin()]
+        row = q[q["strike"] == k].set_index("cp_flag")
+        print(f"    {d.date()}  close {close:.2f}  exdate {q['exdate'].iloc[0].date()}  "
+              f"K {k:g}  call {row.at['C', 'best_bid']:.2f}/{row.at['C', 'best_offer']:.2f}  "
+              f"put {row.at['P', 'best_bid']:.2f}/{row.at['P', 'best_offer']:.2f}")
+
+    pm_today = opt.loc[(opt["am_settlement"] == 0) & (opt["exdate"] == opt["date"]), "date"].unique()
+    share = und["date"].isin(pm_today).groupby(und["date"].dt.year).mean()
+    print("  share of trading dates with a close-settled expiry that day:")
+    for y, v in share.items():
+        print(f"    {y}: {v:.0%}")
+
+    print(f"  last date available: {last.date()}")
+    ev_path = processed_path("events.parquet")
+    if ev_path.exists():
+        ev = pd.read_parquet(ev_path)
+        print(f"  events after {last.date()} (outside the sample): {(ev['event_date'] > last).sum()}")
+    else:
+        print("  events table not built yet (needs FRED key); count of events after "
+              "the last date pending")
+
+    if not ok:
+        raise AssertionError("options: acceptance checks failed (see FAIL lines)")
 
 
 # --- FRED / ALFRED ----------------------------------------------------------

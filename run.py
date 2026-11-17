@@ -13,9 +13,14 @@ from src import backtest, data, events, options, signal
 
 
 def step_data(cfg, refresh):
-    data.pull_fred(cfg)
-    data.pull_underlying(cfg)
-    data.pull_options(cfg)
+    # FRED series (data.pull_fred) are added here in step 5.
+    db = data.wrds_connection()
+    try:
+        data.pull_underlying(cfg, refresh, db)
+        data.pull_options(cfg, refresh, db)
+    finally:
+        db.close()
+    data.validate_options(cfg)
 
 
 def step_events(cfg, refresh):

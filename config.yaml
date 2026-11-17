@@ -249,7 +249,9 @@ series:
 
 options:
   underlying: SPX
-  optionmetrics_secid: 108105   # S&P 500 index; verify in optionm.securd
+  optionmetrics_secid: 108105   # S&P 500 index; verified in optionm.secnmd (CBOE S&P 500 INDEX)
+  max_days_to_expiry: 7         # pull and structure filter: exdate - date
+  strike_band_pct: 0.15         # pull filter: |strike / close - 1|
   wing_width_pct: 0.02          # distance of the protective options from the strike
   entry: prior_close
   exit: event_close
