@@ -260,6 +260,10 @@ costs:
   fill: mid                     # mid | cross (sell at bid, buy at ask)
   half_spread_haircut: 0.5      # fraction of half-spread paid when fill = mid
 
+backtest:
+  bootstrap_draws: 10000        # resamples for 95% intervals
+  seed: 0                       # fixed so results reproduce
+
 signal:
   zscore_window_months: 60
   sensitivity_window_events: 24
