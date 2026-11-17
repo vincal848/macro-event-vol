@@ -2,18 +2,40 @@
 
 import numpy as np
 import pandas as pd
+import pandas.tseries.holiday as hol
 
 MONTHLY_RANGE = (11, 12)   # acceptance: releases per full calendar year
 FOMC_PER_YEAR = 8
 GDP_PER_YEAR = 4
 
 
+class NYSEHolidays(hol.AbstractHolidayCalendar):
+    """Regular NYSE full-day holidays. Fallback only: misses one-off closures
+    (e.g. Hurricane Sandy 2012, national days of mourning), which the trading
+    calendar from the underlying table picks up after the WRDS pull."""
+    rules = [
+        hol.Holiday("New Year's Day", month=1, day=1, observance=hol.sunday_to_monday),
+        hol.USMartinLutherKingJr,
+        hol.USPresidentsDay,
+        hol.GoodFriday,
+        hol.USMemorialDay,
+        hol.Holiday("Juneteenth", month=6, day=19, start_date="2022-01-01",
+                    observance=hol.nearest_workday),
+        hol.Holiday("Independence Day", month=7, day=4, observance=hol.nearest_workday),
+        hol.USLaborDay,
+        hol.USThanksgivingDay,
+        hol.Holiday("Christmas", month=12, day=25, observance=hol.nearest_workday),
+    ]
+
+
 def trading_calendar(underlying: pd.DataFrame | None, start, end) -> tuple[pd.DatetimeIndex, str]:
-    """Trading dates from the underlying table, or weekdays if it does not
-    exist yet (recompute the calendar after the WRDS pull)."""
+    """Trading dates from the underlying table, or weekdays less regular NYSE
+    holidays if it does not exist yet (recompute after the WRDS pull)."""
     if underlying is not None:
         return pd.DatetimeIndex(underlying["date"]).sort_values(), "underlying"
-    return pd.bdate_range(start, end), "weekdays (underlying not pulled yet)"
+    days = pd.bdate_range(start, end)
+    days = days[~days.isin(NYSEHolidays().holidays(start, end))]
+    return days, "weekdays less regular NYSE holidays (underlying not pulled yet)"
 
 
 def _log_drop(label: str, before: int, after: int) -> None:
@@ -32,8 +54,9 @@ def build_calendar(cfg: dict, release_dates: pd.DataFrame,
                    today: pd.Timestamp | None = None) -> pd.DataFrame:
     """One row per release.
 
-    Columns: event, family, event_date, entry_date, time_et, n_events_on_date
-    is added by flag_overlaps.
+    Columns: event, family, event_date (trading date), release_date (as
+    published; differs only for non-trading-day releases), entry_date,
+    time_et. n_events_on_date is added by flag_overlaps.
     """
     today = (today or pd.Timestamp.today()).normalize()
     frames = []
@@ -64,8 +87,30 @@ def build_calendar(cfg: dict, release_dates: pd.DataFrame,
     _log_drop(f"event_date <= {'sample end' if cfg['sample']['end'] else 'today'} {end.date()}",
               before, len(events))
 
-    calendar, source = trading_calendar(underlying, start - pd.Timedelta(days=15), end)
+    calendar, source = trading_calendar(underlying, start - pd.Timedelta(days=15),
+                                        end + pd.Timedelta(days=15))
     print(f"  trading calendar: {source}")
+
+    # Releases on non-trading days (e.g. payrolls on Good Friday).
+    events = events.rename(columns={"event_date": "release_date"})
+    closed = ~events["release_date"].isin(calendar)
+    rule = cfg["non_trading_day_releases"]
+    if closed.any():
+        print(f"  {closed.sum()} releases on non-trading days ({rule}):")
+        print("    " + events.loc[closed, ["event", "release_date"]]
+              .to_string(index=False).replace("\n", "\n    "))
+    if rule == "drop":
+        before = len(events)
+        events = events[~closed]
+        _log_drop("release on non-trading day", before, len(events))
+    elif rule != "next_trading_day":
+        raise ValueError(f"non_trading_day_releases: unknown rule {rule!r}")
+    nxt = calendar.searchsorted(events["release_date"].to_numpy(), side="left")
+    if (nxt >= len(calendar)).any():
+        raise RuntimeError("release after the last trading date; extend the calendar")
+    events = events.assign(event_date=calendar[nxt])
+
+    # Entry: last trading date strictly before the event date.
     pos = calendar.searchsorted(events["event_date"].to_numpy(), side="left") - 1
     if (pos < 0).any():
         raise RuntimeError("event before the first trading date; extend the calendar")
@@ -74,7 +119,7 @@ def build_calendar(cfg: dict, release_dates: pd.DataFrame,
     events = events.sort_values(["event_date", "event"]).reset_index(drop=True)
     if events.duplicated(["event", "event_date"]).any():
         raise RuntimeError("duplicate event, event_date in calendar")
-    return events[["event", "family", "event_date", "entry_date", "time_et"]]
+    return events[["event", "family", "event_date", "release_date", "entry_date", "time_et"]]
 
 
 def add_surprises(events: pd.DataFrame, bloomberg: pd.DataFrame | None) -> pd.DataFrame:
@@ -105,13 +150,15 @@ def _full_years(events: pd.DataFrame, cfg: dict, last_date: pd.Timestamp) -> ran
     return range(first, last + 1)
 
 
-def _count_check(events, event, years, lo, hi) -> bool:
-    counts = (events.loc[events["event"] == event, "event_date"].dt.year
-              .value_counts().reindex(years, fill_value=0))
+def _count_check(events, event, years, lo, hi, extra=()) -> bool:
+    dates = pd.concat([events.loc[events["event"] == event, "event_date"],
+                       pd.Series(pd.to_datetime(list(extra)), dtype="datetime64[ns]")])
+    counts = dates.dt.year.value_counts().reindex(years, fill_value=0)
     bad = counts[(counts < lo) | (counts > hi)]
     want = f"{lo}" if lo == hi else f"{lo}-{hi}"
+    note = f" (incl. {len(extra)} cancelled)" if len(extra) else ""
     print(f"  {'PASS' if bad.empty else 'FAIL'}  {event}: {want} per full year "
-          f"{years[0]}-{years[-1]}")
+          f"{years[0]}-{years[-1]}{note}")
     for year, n in bad.items():
         print(f"          {year}: {n}")
     return bad.empty
@@ -122,14 +169,17 @@ def validate_events(events: pd.DataFrame, cfg: dict, last_date: pd.Timestamp) ->
     ok = True
     for event, spec in cfg["events"].items():
         if event == "fomc":
-            ok &= _count_check(events, event, years, FOMC_PER_YEAR, FOMC_PER_YEAR)
+            ok &= _count_check(events, event, years, FOMC_PER_YEAR, FOMC_PER_YEAR,
+                               extra=cfg.get("fomc_cancelled", []))
         elif spec.get("first_release_after_quarter_end"):
             ok &= _count_check(events, event, years, GDP_PER_YEAR, GDP_PER_YEAR)
         else:
             ok &= _count_check(events, event, years, *MONTHLY_RANGE)
 
-    weekend = events[events["event_date"].dt.dayofweek >= 5]
-    print(f"  {'PASS' if weekend.empty else 'FAIL'}  no event date on a weekend "
+    # On release_date: event_date is a trading date by construction, so a
+    # weekend in the source would otherwise be silently rolled to Monday.
+    weekend = events[events["release_date"].dt.dayofweek >= 5]
+    print(f"  {'PASS' if weekend.empty else 'FAIL'}  no release on a weekend "
           f"({len(weekend)} found)")
     if not weekend.empty:
         print(weekend.to_string(index=False))

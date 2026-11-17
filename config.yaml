@@ -51,6 +51,12 @@ events:
     bbg: "FDTR Index"
     time_et: "14:00"
 
+# A release on a date the stock market is closed (e.g. payrolls on Good
+# Friday) is assigned to the next trading date, the first close that can
+# react to it. The original date is kept in the release_date column.
+#   next_trading_day | drop
+non_trading_day_releases: next_trading_day
+
 # FOMC announcement dates (second day of two-day meetings), from the
 # Federal Reserve Board's meeting calendar pages (fomccalendars.htm and
 # fomchistorical<year>.htm), retrieved 2026-11-17. Scheduled meetings only.
@@ -200,6 +206,11 @@ fomc_dates:
   - "2027-09-15"
   - "2027-10-27"
   - "2027-11-17"
+
+# Scheduled meetings that were cancelled. Not events (no announcement), but
+# they count toward the 8 scheduled meetings per year in the acceptance check.
+fomc_cancelled:
+  - "2020-03-18"   # scheduled March 17-18, replaced by the March 15 meeting
 
 # Unscheduled meetings, kept separate so they can be flagged later.
 fomc_unscheduled:
